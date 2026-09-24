@@ -6,6 +6,7 @@
   "version": "0.0.0",
   "scripts": {
     "start": "vite dev",
+    "test": "vitest run",
     "deploy": "vite build && wrangler deploy",
     "types": "wrangler types env.d.ts --include-runtime false"
   },

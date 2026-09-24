@@ -49,3 +49,4 @@ jobs:
       - run: CI=true pnpm exec nx affected -t test
 
       - run: pnpm exec pkg-pr-new publish --peerDeps ./packages/*
+        if: ${{ github.repository == 'cloudflare/agents' }}

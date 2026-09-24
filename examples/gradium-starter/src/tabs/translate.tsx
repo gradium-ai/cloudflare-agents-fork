@@ -125,6 +125,10 @@ export function TranslateTab() {
   const [target, setTarget] = useState(LANGUAGES[0].code);
   const [voiceId, setVoiceId] = useState(LANGUAGES[0].voices[0].id);
   const [recording, setRecording] = useState(false);
+  const [connected, setConnected] = useState(false);
+  const activeRef = useRef(false);
+  const generationRef = useRef(0);
+  const readyRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [translation, setTranslation] = useState("");
 
@@ -140,29 +144,50 @@ export function TranslateTab() {
   const agent = useAgent({
     agent: "translate-agent",
     name: sessionId,
+    onOpen: () => setConnected(true),
+    onClose: () => {
+      setConnected(false);
+      if (activeRef.current) {
+        setError("Connection lost. Reconnect and try again.");
+        stop(false);
+      }
+    },
     onMessage: (event) => {
-      if (typeof event.data !== "string") return;
-      const message = JSON.parse(event.data) as {
-        type?: string;
-        text?: string;
-        audio?: string;
-        sampleRate?: number;
-      };
-
+      if (!activeRef.current || typeof event.data !== "string") return;
+      let message: Record<string, unknown>;
+      try {
+        const parsed: unknown = JSON.parse(event.data);
+        if (!parsed || typeof parsed !== "object") return;
+        message = parsed as Record<string, unknown>;
+      } catch {
+        return;
+      }
       if (message.type === "translation-ready") {
-        // The session reports its output rate; playback must match it, or the
-        // audio plays pitch-shifted. Arrives before the first audio chunk.
+        readyRef.current = true;
         if (typeof message.sampleRate === "number" && message.sampleRate > 0) {
           playbackRateRef.current = message.sampleRate;
         }
-      } else if (message.type === "translation-text" && message.text) {
-        setTranslation((current) =>
-          appendSegment(current, message.text as string)
-        );
-      } else if (message.type === "translation-audio" && message.audio) {
-        playChunk(message.audio);
+      } else if (
+        message.type === "translation-text" &&
+        typeof message.text === "string"
+      ) {
+        const text = message.text;
+        setTranslation((current) => appendSegment(current, text));
+      } else if (
+        message.type === "translation-audio" &&
+        typeof message.audio === "string"
+      ) {
+        try {
+          playChunk(message.audio);
+        } catch {
+          setError("Could not play translated audio. Try again.");
+          stop();
+        }
       } else if (message.type === "translation-error") {
         setError("Translation failed. Try again.");
+        stop(false);
+      } else if (message.type === "translation-stopped") {
+        stop(false);
       }
     }
   });
@@ -187,37 +212,57 @@ export function TranslateTab() {
     cursorRef.current = startAt + buffer.duration;
   }, []);
 
-  const stop = useCallback(() => {
-    processorRef.current?.disconnect();
-    processorRef.current = null;
-    void captureRef.current?.close();
-    captureRef.current = null;
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
-    setRecording(false);
-    void agent.stub.stopTranslation();
-  }, [agent]);
+  const stop = useCallback(
+    (notify = true) => {
+      const wasActive = activeRef.current;
+      activeRef.current = false;
+      generationRef.current++;
+      readyRef.current = false;
+      processorRef.current?.disconnect();
+      processorRef.current = null;
+      void captureRef.current?.close().catch(() => {});
+      captureRef.current = null;
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+      void playbackRef.current?.close().catch(() => {});
+      playbackRef.current = null;
+      cursorRef.current = 0;
+      setRecording(false);
+      if (notify && wasActive && agent.readyState === WebSocket.OPEN) {
+        void agent.stub.stopTranslation().catch(() => {});
+      }
+    },
+    [agent]
+  );
 
   const start = useCallback(async () => {
+    if (activeRef.current || agent.readyState !== WebSocket.OPEN) return;
+    activeRef.current = true;
+    const generation = ++generationRef.current;
+    setRecording(true);
     setError(null);
     setTranslation("");
-    // A fresh session may report a different output rate, so drop any playback
-    // context left over from the previous one.
-    void playbackRef.current?.close();
-    playbackRef.current = null;
+    playbackRateRef.current = DEFAULT_PLAYBACK_SAMPLE_RATE;
     try {
-      await agent.stub.startTranslation(target, voiceId);
-
+      const started = await agent.stub.startTranslation(target, voiceId);
+      if (generation !== generationRef.current) return;
+      if (!started) {
+        stop(false);
+        return;
+      }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (generation !== generationRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       streamRef.current = stream;
-
       const ctx = new AudioContext({ sampleRate: CAPTURE_SAMPLE_RATE });
       captureRef.current = ctx;
       const source = ctx.createMediaStreamSource(stream);
       const processor = ctx.createScriptProcessor(4096, 1, 1);
       processorRef.current = processor;
-
       processor.onaudioprocess = (event) => {
+        if (!readyRef.current || generation !== generationRef.current) return;
         const samples = event.inputBuffer.getChannelData(0);
         agent.send(
           JSON.stringify({
@@ -226,17 +271,18 @@ export function TranslateTab() {
           })
         );
       };
-
       source.connect(processor);
       processor.connect(ctx.destination);
-      setRecording(true);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+    } catch {
+      if (generation !== generationRef.current) return;
+      setError(
+        "Could not start translation. Check microphone access and try again."
+      );
       stop();
     }
   }, [agent, stop, target, voiceId]);
 
-  useEffect(() => stop, [stop]);
+  useEffect(() => () => stop(), [stop]);
 
   return (
     <div className="mx-auto flex h-full max-w-3xl flex-col gap-4 px-5 py-4">
@@ -286,6 +332,7 @@ export function TranslateTab() {
 
           <Button
             variant={recording ? "destructive" : "primary"}
+            disabled={!connected}
             onClick={() => (recording ? stop() : void start())}
             icon={
               recording ? (

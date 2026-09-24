@@ -1,101 +1,59 @@
-import { Agent, callable, type Connection } from "agents";
+import { Agent, callable, getCurrentAgent, type Connection } from "agents";
+import { TranslationSession } from "../lib/translation-session";
 
-// Workers can't open wss:// with fetch — use https:// plus an Upgrade header.
-const S2S_URL = "https://api.gradium.ai/api/speech/s2s";
-
-/**
- * Live speech translation over a single Gradium speech-to-speech socket.
- *
- * Audio goes in, translated audio comes back — transcription, translation and
- * re-synthesis all happen inside Gradium, so there is no LLM in this path.
- */
+/** Live speech translation over one Gradium speech-to-speech socket. */
 export class TranslateAgent extends Agent<Env> {
-  /** Outbound socket to Gradium, open only while the user is recording. */
-  #socket: WebSocket | null = null;
+  #session: TranslationSession | null = null;
+  #owner: string | undefined;
 
-  /**
-   * Opens a Gradium session that translates into `targetLanguage`, speaking
-   * with `voiceId` — a library voice for that language.
-   */
   @callable()
   async startTranslation(targetLanguage: string, voiceId: string) {
-    this.#closeSocket();
-
-    const response = await fetch(S2S_URL, {
-      headers: { Upgrade: "websocket", "x-api-key": this.env.GRADIUM_API_KEY }
-    });
-    const socket = response.webSocket;
-    if (!socket) throw new Error("Gradium s2s WebSocket upgrade failed.");
-    socket.accept();
-    this.#socket = socket;
-
-    socket.addEventListener("message", (event) => {
-      if (typeof event.data !== "string") return;
-      const message = JSON.parse(event.data) as Record<string, unknown>;
-
-      switch (message.type) {
-        case "ready":
-          // Input is 24 kHz PCM; the output rate (48 kHz for "pcm") is reported
-          // here, and the browser schedules playback with it.
-          this.#send({
-            type: "translation-ready",
-            sampleRate: message.sample_rate
-          });
-          break;
-        case "text":
-          this.#send({ type: "translation-text", text: message.text });
-          break;
-        case "audio":
-          this.#send({ type: "translation-audio", audio: message.audio });
-          break;
-        case "error":
-          console.error("Gradium translation error:", message.message);
-          this.#send({ type: "translation-error" });
-          break;
+    this.#closeSession();
+    const connection = getCurrentAgent().connection;
+    if (!connection)
+      throw new Error("Translation requires a browser connection.");
+    this.#owner = connection.id;
+    const session = new TranslationSession(
+      this.env.GRADIUM_API_KEY,
+      (message) => {
+        // A replaced session cannot send events into the current recording.
+        if (this.#session === session) connection.send(JSON.stringify(message));
       }
-    });
-    socket.addEventListener("close", () => {
-      this.#socket = null;
-    });
-
-    socket.send(
-      JSON.stringify({
-        type: "setup",
-        model_name: "s2s-translate",
-        stt_model_name: "stt-translate",
-        tts_model_name: "default",
-        input_format: "pcm",
-        output_format: "pcm",
-        voice_id: voiceId,
-        json_config: { target_language: targetLanguage }
-      })
     );
+    this.#session = session;
+    return session.connect(targetLanguage, voiceId);
   }
 
   @callable()
   async stopTranslation() {
-    this.#socket?.send(JSON.stringify({ type: "end_of_stream" }));
-    this.#closeSocket();
+    if (getCurrentAgent().connection?.id === this.#owner) this.#closeSession();
   }
 
-  /** Forwards microphone frames from the browser to Gradium. */
-  onMessage(_connection: Connection, message: string | ArrayBuffer) {
-    if (typeof message !== "string" || !this.#socket) return;
-    const { type, data } = JSON.parse(message) as {
-      type?: string;
-      data?: string;
-    };
-    if (type === "audio-chunk" && data) {
-      this.#socket.send(JSON.stringify({ type: "audio", audio: data }));
+  onClose(connection: Connection) {
+    if (connection.id === this.#owner) this.#closeSession();
+  }
+
+  onMessage(connection: Connection, data: string | ArrayBuffer) {
+    if (connection.id !== this.#owner || typeof data !== "string") return;
+    try {
+      const message: unknown = JSON.parse(data);
+      if (
+        message &&
+        typeof message === "object" &&
+        "type" in message &&
+        message.type === "audio-chunk" &&
+        "data" in message &&
+        typeof message.data === "string"
+      )
+        this.#session?.feed(message.data);
+    } catch {
+      // Ignore malformed client frames.
     }
   }
 
-  #send(message: Record<string, unknown>) {
-    this.broadcast(JSON.stringify(message));
-  }
-
-  #closeSocket() {
-    this.#socket?.close();
-    this.#socket = null;
+  #closeSession() {
+    this.#session?.close();
+    this.#session = null;
+    this.#owner = undefined;
   }
 }
